@@ -2,42 +2,67 @@ import os
 import io
 import json
 import torch
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from torchvision import transforms
 from PIL import Image
 from dotenv import load_dotenv
+import torchvision.models as models
+import torch.nn as nn
 
-# 1. Load environment variables
+# Importing your custom architecture blueprint
+from model_architecture import HybridMobileNetSwin
+
 load_dotenv()
 MODEL_PATH = os.getenv("MODEL_PATH", "model.pt")
 CLASSES_PATH = os.getenv("CLASSES_PATH", "classes.json")
-
-# 2. Initialize FastAPI
-app = FastAPI(title="PlantVillage Disease Detection API")
-
-# 3. Determine device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 4. Load PlantVillage classes dynamically
-try:
-    with open(CLASSES_PATH, "r") as f:
-        CLASSES = json.load(f)
-except FileNotFoundError:
-    raise RuntimeError(f"Critical Error: {CLASSES_PATH} not found. Cannot map predictions to classes.")
+# Create a global dictionary to hold the model so it can be shared with endpoints
+ml_models = {}
 
-# 5. Load the model globally on startup
-try:
-    # If the file contains only the state dictionary (recommended):
-    # model = SwinTransformer(...) # You would need your model class definition here
-    # model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- STARTUP LOGIC ---
     
-    # If you saved the full model using torch.save(model, 'model.pt'):
-    model = torch.load(MODEL_PATH, map_location=device)
-    model.eval()
-except Exception as e:
-    raise RuntimeError(f"Critical Error: Failed to load model from {MODEL_PATH}. Details: {e}")
+    # 1. Load classes FIRST so we know how many output nodes the model needs
+    try:
+        with open(CLASSES_PATH, "r") as f:
+            ml_models["classes"] = json.load(f)
+            num_classes = len(ml_models["classes"])
+    except FileNotFoundError:
+        raise RuntimeError("Failed to load classes.json on startup.")
 
-# 6. Define Swin Transformer preprocessing (ImageNet standards)
+    print(f"Loading ConSwinTX-Lite Architecture on {device}...")
+    try:
+        # 2. Initialize the empty custom architecture using the class we imported
+        model = HybridMobileNetSwin(num_classes=num_classes)
+        
+        # 3. Load the dictionary of trained weights
+        state_dict = torch.load(MODEL_PATH, map_location=device)
+        
+        # 4. Inject the weights into the empty architecture
+        model.load_state_dict(state_dict)
+        
+        # 5. Move to GPU/CPU and set to evaluation mode
+        model.to(device)
+        model.eval()
+        
+        ml_models["plant_model"] = model
+        print("Model and weights loaded successfully!")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model on startup: {e}")
+
+    # Yield hands control back to FastAPI so it can start taking user requests.
+    yield
+    
+    # --- SHUTDOWN LOGIC ---
+    print("Shutting down API. Clearing model from memory...")
+    ml_models.clear()
+    
+# Initialize FastAPI and pass in the lifespan context manager
+app = FastAPI(title="PlantDisease API", lifespan=lifespan)
+
 preprocess = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -46,42 +71,43 @@ preprocess = transforms.Compose([
 
 @app.post("/predict")
 async def predict_disease(file: UploadFile = File(...)):
-    # Validate file type
     if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File provided is not an image.")
+        raise HTTPException(status_code=400, detail="File must be an image.")
 
     try:
-        # Read and convert the image
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        
-        # Preprocess the tensor
         input_tensor = preprocess(image).unsqueeze(0).to(device)
         
-        # Inference
+        # Access the model and classes from the shared global dictionary
+        model = ml_models["plant_model"]
+        classes = ml_models["classes"]
+        
         with torch.no_grad():
+            # 1. Get raw scores (logits) from the model
             outputs = model(input_tensor)
-            _, predicted_idx = torch.max(outputs, 1)
+            
+            # 2. Convert logits to standard probabilities (0.0 to 1.0) using Softmax
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+            
+            # 3. Get the highest probability and its corresponding class index
+            max_prob, predicted_idx = torch.max(probabilities, 1)
             
             idx = predicted_idx.item()
+            confidence_percentage = max_prob.item() * 100  # Convert to a percentage
             
-            # Map index to PlantVillage class securely
-            if idx < len(CLASSES):
-                predicted_class = CLASSES[idx]
-                
-                # Optional string formatting to make the JSON response cleaner
-                # e.g. "Apple___Apple_scab" -> "Apple - Apple scab"
-                clean_class_name = predicted_class.replace("___", " - ").replace("_", " ")
+            if idx < len(classes):
+                predicted_class = classes[idx].replace("___", " - ").replace("_", " ")
             else:
-                clean_class_name = f"Unknown Class ID: {idx}"
+                predicted_class = f"Unknown Class ID: {idx}"
             
+        # 4. Return both the prediction and the formatted confidence score
         return {
-            "status": "success",
-            "prediction": clean_class_name,
-            "filename": file.filename
+            "status": "success", 
+            "prediction": predicted_class,
+            "confidence": f"{confidence_percentage:.2f}%"
         }
         
     except Exception as e:
-        # Log the actual error internally, but return a clean 500 status to the client
         print(f"Inference error: {e}")
-        raise HTTPException(status_code=500, detail="An error occurred during model inference.")
+        raise HTTPException(status_code=500, detail="Inference failed.")
