@@ -1,68 +1,111 @@
-import diseaseData from "./diseaseData.js";
-import express, { json } from "express";
-import cors from "cors";
-import multer, { memoryStorage } from "multer";
-import axios from "axios";
-import FormData from "form-data";
+import express from 'express';
+import multer from 'multer';
+import rateLimit from 'express-rate-limit';
+import cors from 'cors';
+import axios from 'axios';
+import FormData from 'form-data';
+import { Queue, Worker } from 'bullmq';
+import IORedis from 'ioredis';
+import 'dotenv/config'; 
 
 const app = express();
-const PORT = 5000;
+app.use(cors());
+app.use(express.json());
 
-// Middleware
-app.use(cors()); // Allows your React frontend to communicate with this backend
-app.use(json());
+// 1. Initialize the Cloud Redis Connection
+const redisConnection = new IORedis(process.env.REDIS_URL, {
+    maxRetriesPerRequest: null
+});
 
-// Set up Multer to store uploaded files temporarily in RAM (MemoryStorage)
-const upload = multer({ storage: memoryStorage() });
+// 2. System Design: Persistent Message Queue
+const imageQueue = new Queue('leaf-processing-queue', { 
+    connection: redisConnection 
+});
 
-// The main route to handle image uploads
-app.post("/api/analyze", upload.single("image"), async (req, res) => {
+const uploadLimiter = rateLimit({
+    windowMs: 60 * 1000, 
+    max: 5, 
+    message: { error: "Too many requests. Please wait a minute." },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+// 3. System Design: Background Worker (Listens to Redis)
+// This automatically picks up jobs placed into the Redis queue
+const worker = new Worker('leaf-processing-queue', async (job) => {
+    const { imageBuffer, originalName } = job.data;
+    
+    // Convert the base64 string back to a buffer for FastAPI
+    const buffer = Buffer.from(imageBuffer, 'base64');
+    
+    const formData = new FormData();
+    formData.append('file', buffer, originalName);
+
+    const response = await axios.post(process.env.ML_SERVICE_URL, formData, {
+        headers: formData.getHeaders()
+    });
+
+    // BullMQ automatically saves this return value in Redis
+    return {
+        prediction: response.data.prediction,
+        confidence: response.data.confidence
+    };
+}, { connection: redisConnection });
+
+worker.on('failed', (job, err) => {
+    console.error(`Job ${job.id} failed:`, err.message);
+});
+
+// 4. API Route: Push to Redis Queue
+app.post('/api/upload', uploadLimiter, upload.single('leaf_image'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: 'No image provided.' });
+    }
+
     try {
-        // 1. Check if a file was actually uploaded
-        if (!req.file) {
-            return res.status(400).json({ error: "No image file provided." });
-        }
+        // Convert buffer to base64 so it can be safely stored in Redis JSON
+        const base64Image = req.file.buffer.toString('base64');
 
-        console.log(`Received file: ${req.file.originalname}`);
-
-        // 2. Prepare the file to be sent to Python
-        // We use form-data to mimic a real HTML form submission
-        const formData = new FormData();
-        formData.append("file", req.file.buffer, req.file.originalname);
-
-        // 3. Forward the image to your Python Microservice
-        console.log("Forwarding to Python microservice...");
-        const pythonResponse = await axios.post("http://127.0.0.1:8000/predict", formData, {
-            headers: {
-                ...formData.getHeaders(),
-            },
+        // Add the job to Upstash Redis
+        const job = await imageQueue.add('analyze-leaf', {
+            imageBuffer: base64Image,
+            originalName: req.file.originalname
         });
 
-        const predictedClass = pythonResponse.data.disease;
-        const confidence = pythonResponse.data.confidence;
-
-        // 4. Look up the precautions in our knowledge base
-        // If the disease isn't in our file yet, provide a fallback message
-        const plantInfo = diseaseData[predictedClass] || {
-            description: "Information currently unavailable for this specific condition.",
-            precautions: ["Please consult a local agricultural expert."]
-        };
-
-        // 5. Send the combined data back to the React frontend
-        console.log("Sending complete diagnosis to client.");
-        res.json({
-            disease: predictedClass,
-            confidence: confidence,
-            details: plantInfo
+        res.status(202).json({ 
+            message: 'Image successfully queued for analysis', 
+            job_id: job.id 
         });
-
     } catch (error) {
-        console.error("Error communicating with Python service:", error.message);
-        res.status(500).json({ error: "Failed to analyze image." });
+        res.status(500).json({ error: 'Failed to connect to queue.' });
     }
 });
 
-// Start the server
+// 5. API Route: Poll Redis for Status
+app.get('/api/status/:jobId', async (req, res) => {
+    try {
+        const job = await imageQueue.getJob(req.params.jobId);
+        
+        if (!job) {
+            return res.status(404).json({ error: 'Job identifier not found.' });
+        }
+
+        const state = await job.getState();
+        const result = job.returnvalue;
+
+        res.json({ 
+            job_id: job.id, 
+            status: state, // 'waiting', 'active', 'completed', 'failed'
+            result: result || null 
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch status.' });
+    }
+});
+
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-    console.log(`Express Gateway is running on http://localhost:${PORT}`);
+    console.log(`Node.js Backend active on port ${PORT} using Upstash Redis`);
 });
