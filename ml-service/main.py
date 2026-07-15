@@ -69,6 +69,10 @@ preprocess = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+@app.get("/")
+async def root():
+    return {"message": "ConSwinTX-Lite ML Service is awake and ready!"}
+
 @app.post("/predict")
 async def predict_disease(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
